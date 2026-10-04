@@ -22,6 +22,7 @@ const baseState: ThreadActionMenuState = {
     snooze: true,
     pinning: true,
     titleRegeneration: true,
+    pullRequestLinking: true,
   },
   snoozePresets: [
     { id: "hour", label: "In 1 hour", whenLabel: "3:00 PM", snoozedUntil: "2026-08-07T15:00:00Z" },
@@ -49,6 +50,7 @@ describe("buildThreadActionMenuItems", () => {
           snooze: false,
           pinning: false,
           titleRegeneration: false,
+          pullRequestLinking: false,
         },
       }),
     ).toEqual(["rename", "mark-unread", "copy", "project-settings", "archive", "delete"]);
@@ -135,6 +137,15 @@ describe("buildThreadActionMenuItems", () => {
     expect(item).toMatchObject({ label: "Regenerating…", disabled: true });
   });
 
+  it("offers pull request linking only where the environment supports it", () => {
+    expect(
+      buildThreadActionMenuItems(baseState).find((item) => item.id === "link-pull-request"),
+    ).toMatchObject({ label: "Link pull request…", icon: "link-2" });
+    expect(
+      ids({ ...baseState, supports: { ...baseState.supports, pullRequestLinking: false } }),
+    ).not.toContain("link-pull-request");
+  });
+
   it("marks delete as destructive and keeps it last", () => {
     const items = buildThreadActionMenuItems({ ...baseState, branch: "main" });
     expect(items.at(-1)).toMatchObject({ id: "delete", destructive: true });
@@ -159,6 +170,7 @@ describe("buildThreadActionMenuItems", () => {
           snooze: false,
           pinning: false,
           titleRegeneration: false,
+          pullRequestLinking: false,
         },
       }),
     ).toContain("archive");

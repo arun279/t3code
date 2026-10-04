@@ -1,5 +1,6 @@
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { requestCustomSnooze } from "../components/CustomSnoozeDialog";
+import { openLinkPullRequestDialog } from "../components/pullRequest/LinkPullRequestDialog";
 import {
   type AtomCommandResult,
   isAtomCommandInterrupted,
@@ -22,6 +23,7 @@ import { useAtomCommand } from "../state/use-atom-command";
 import {
   readEnvironmentSupportsAutoSettleOptOut,
   readEnvironmentSupportsPinning,
+  readEnvironmentSupportsPullRequestLinking,
   readEnvironmentSupportsSettlement,
   readEnvironmentSupportsSnooze,
   readEnvironmentSupportsTitleRegeneration,
@@ -138,6 +140,7 @@ export function useThreadActionMenu(input: {
           snooze: readEnvironmentSupportsSnooze(threadRef.environmentId),
           pinning: readEnvironmentSupportsPinning(threadRef.environmentId),
           titleRegeneration: readEnvironmentSupportsTitleRegeneration(threadRef.environmentId),
+          pullRequestLinking: readEnvironmentSupportsPullRequestLinking(threadRef.environmentId),
         };
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const snoozePresets = resolveSnoozePresets(now, timestampFormat);
@@ -244,6 +247,9 @@ export function useThreadActionMenu(input: {
                 input: { threadId: threadRef.threadId, regenerateTitle: true },
               }),
             );
+            return;
+          case "link-pull-request":
+            openLinkPullRequestDialog(threadRef);
             return;
           case "mark-unread":
             markThreadUnread(threadRef);

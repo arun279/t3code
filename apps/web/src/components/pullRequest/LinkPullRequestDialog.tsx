@@ -28,8 +28,8 @@ import { Input } from "../ui/input";
 
 /**
  * Which thread has the link dialog open, set by whichever entry point asked (command palette,
- * pull-requests surface, detail panel) and rendered once by the chat view so the dialog outlives
- * a palette that closes the moment its command runs.
+ * thread menu, pull-requests surface, detail panel) and rendered once at the app root so the
+ * dialog outlives a menu or palette that closes the moment its command runs.
  */
 const linkPullRequestDialogThreadAtom = Atom.make<ScopedThreadRef | null>(null).pipe(
   Atom.keepAlive,
@@ -48,7 +48,7 @@ interface LinkPullRequestDialogProps {
   onOpenChange: (open: boolean) => void;
 }
 
-/** Mounted once per chat view; shows the dialog for whichever thread asked for it. */
+/** Mounted once at the app root; shows the dialog for whichever thread asked for it. */
 export function LinkPullRequestDialogHost() {
   const threadRef = useAtomValue(linkPullRequestDialogThreadAtom);
   const thread = useThreadShell(threadRef);

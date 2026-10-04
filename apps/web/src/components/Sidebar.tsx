@@ -9,6 +9,7 @@ import {
 } from "./chat/threadContextDrag";
 import { discardComposerDraft } from "../lib/discardComposerDraft";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
+import { openLinkPullRequestDialog } from "./pullRequest/LinkPullRequestDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { useAtomValue } from "@effect/atom-react";
@@ -148,6 +149,7 @@ import {
   usePrimaryEnvironmentId,
 } from "../state/environments";
 import {
+  readEnvironmentSupportsPullRequestLinking,
   readThreadShell,
   useAllEnvironmentProjectSnapshotsReady,
   useProjects,
@@ -4478,6 +4480,7 @@ export default function Sidebar() {
                 snooze: supportsSnooze,
                 pinning: supportsPinning,
                 titleRegeneration: supportsTitleRegeneration,
+                pullRequestLinking: readEnvironmentSupportsPullRequestLinking(thread.environmentId),
               },
               snoozePresets,
             }),
@@ -4585,6 +4588,9 @@ export default function Sidebar() {
             }
             return;
           }
+          case "link-pull-request":
+            openLinkPullRequestDialog(threadRef);
+            return;
           case "mark-unread":
             markThreadUnread(threadRef);
             return;
