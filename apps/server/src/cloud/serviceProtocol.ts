@@ -100,7 +100,8 @@ function decodeServiceUpdate(value: unknown): ServiceUpdateRecord | undefined {
   }
   if (
     (status === "committed" || status === "rolled-back" || status === "failed") &&
-    (value.dbPath === undefined || (typeof value.dbPath === "string" && value.dbPath.trim() !== "")) &&
+    (value.dbPath === undefined ||
+      (typeof value.dbPath === "string" && value.dbPath.trim() !== "")) &&
     (value.reason === undefined || (typeof value.reason === "string" && value.reason.trim() !== ""))
   ) {
     return {
