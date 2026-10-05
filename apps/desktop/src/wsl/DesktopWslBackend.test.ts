@@ -108,14 +108,11 @@ describe("DesktopWslBackend", () => {
   );
   it.effect("clears the stored preflight error when a registered WSL backend becomes ready", () => {
     let registeredSpec: DesktopBackendPool.BackendInstanceSpec | undefined;
+    let registeredWsl: DesktopBackendPool.DesktopBackendInstance | undefined;
+    let startCount = 0;
     const primary = makeStubInstance({
       id: DesktopBackendPool.PRIMARY_INSTANCE_ID,
       label: "Windows",
-      snapshot: primarySnapshot,
-    });
-    const wsl = makeStubInstance({
-      id: DesktopBackendPool.BackendInstanceId("wsl:Ubuntu"),
-      label: "WSL (Ubuntu)",
       snapshot: primarySnapshot,
     });
     const poolLayer = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
@@ -125,14 +122,25 @@ describe("DesktopWslBackend", () => {
             ? Option.some(primary)
             : Option.none<DesktopBackendPool.DesktopBackendInstance>(),
         ),
-      list: Effect.succeed([primary]),
+      list: Effect.sync(() => (registeredWsl === undefined ? [primary] : [primary, registeredWsl])),
       primary: Effect.succeed(primary),
       register: (spec) =>
         Effect.sync(() => {
           registeredSpec = spec;
-          return wsl;
+          registeredWsl = makeStubInstance({
+            id: spec.id,
+            label: "WSL",
+            snapshot: idleSnapshot,
+            start: Effect.sync(() => {
+              startCount += 1;
+            }),
+          });
+          return registeredWsl;
         }),
-      unregister: () => Effect.die("unexpected unregister"),
+      unregister: () =>
+        Effect.sync(() => {
+          registeredWsl = undefined;
+        }),
     } satisfies DesktopBackendPool.DesktopBackendPool["Service"]);
 
     return Effect.gen(function* () {
@@ -162,12 +170,28 @@ describe("DesktopWslBackend", () => {
       assert.deepEqual(yield* backend.lastPreflightError, Option.some("Node.js not found"));
 
       yield* recordOwnershipFailure();
-      assert.include(
-        Option.getOrThrow(yield* backend.lastPreflightError),
-        "This distro's T3 home is owned",
-      );
+      const refusal = yield* backend.lastPreflightError;
+      assert.include(Option.getOrThrow(refusal), "This distro's T3 home is owned");
+      yield* backend.reconcile;
+      assert.equal(startCount, 1);
+      assert.deepEqual(yield* backend.lastPreflightError, refusal);
 
       yield* clearFailure(new URL("http://127.0.0.1:41773"));
+      assert.deepEqual(yield* backend.lastPreflightError, Option.none());
+      yield* recordOwnershipFailure();
+      const settings = yield* DesktopAppSettings.DesktopAppSettings;
+      yield* settings.setWslDistro("Debian");
+      yield* backend.reconcile;
+      assert.equal(startCount, 2);
+      assert.deepEqual(yield* backend.lastPreflightError, Option.none());
+      const nextSpec = registeredSpec;
+      if (nextSpec?.onStateDirOwned === undefined) throw new Error("Expected ownership callback");
+      yield* nextSpec.onStateDirOwned();
+      yield* settings.setWslBackendEnabled(false);
+      yield* backend.reconcile;
+      yield* settings.setWslBackendEnabled(true);
+      yield* backend.reconcile;
+      assert.equal(startCount, 3);
       assert.deepEqual(yield* backend.lastPreflightError, Option.none());
     }).pipe(
       Effect.provide(

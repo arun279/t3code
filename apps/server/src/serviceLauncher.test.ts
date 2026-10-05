@@ -448,7 +448,7 @@ process.exit(1);
           path.join(root, "runtime", "versions", "1.1.0"),
           'throw new Error("Recovery must not start a trial beside the live owner");\n',
         );
-        const hasBackup = recovery === "restore" || ownerKind === "released";
+        const hasBackup = recovery === "restore";
         if (hasBackup) {
           yield* fs.makeDirectory(backupDir, { recursive: true });
           yield* fs.writeFileString(path.join(backupDir, "database"), "older backup");
@@ -491,7 +491,9 @@ process.exit(1);
                 Effect.sync(() =>
                   vi
                     .spyOn(ServerOwnershipLock, "acquireServerOwnershipLock")
-                    .mockImplementationOnce(async (...args) => {
+                    .mockImplementation(async (...args) => {
+                      const [, options] = args;
+                      if (options?.cli || options?.launcher || released) return acquire(...args);
                       try {
                         return await acquire(...args);
                       } finally {

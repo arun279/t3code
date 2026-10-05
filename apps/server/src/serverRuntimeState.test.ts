@@ -156,6 +156,7 @@ describe("serverRuntimeState", () => {
     const child = NodeChildProcess.spawn(
       process.execPath,
       [
+        "--experimental-strip-types",
         "--input-type=module",
         "--eval",
         `const { acquireServerOwnershipLock } = await import(${encodedModuleUrl});

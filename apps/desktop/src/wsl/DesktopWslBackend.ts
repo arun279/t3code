@@ -113,6 +113,9 @@ export const layer = Layer.effect(
     // Windows, so we record the reason rather than interrupting. Cleared on any
     // reconcile state change so it reflects the current attempt.
     const preflightErrorRef = yield* Ref.make(Option.none<string>());
+    const ownershipRefusedRef = yield* Ref.make(
+      Option.none<DesktopBackendPool.BackendInstanceId>(),
+    );
 
     const findExistingWslInstance = pool.list.pipe(
       Effect.map((instances) => instances.find((instance) => isWslInstanceId(instance.id))),
@@ -169,13 +172,20 @@ export const layer = Layer.effect(
           onPreflightFailed: (failure) =>
             Ref.set(preflightErrorRef, Option.some(failure.reason)).pipe(Effect.as(false)),
           onStateDirOwned: () =>
-            Ref.set(
-              preflightErrorRef,
-              Option.some(
-                "This distro's T3 home is owned by another server or needs interrupted-update recovery. Check the server logs, stop the existing server or recover the update, or pair with the running environment.",
+            Ref.set(ownershipRefusedRef, Option.some(targetId)).pipe(
+              Effect.andThen(
+                Ref.set(
+                  preflightErrorRef,
+                  Option.some(
+                    "This distro's T3 home is owned by another server or needs interrupted-update recovery. Check the server logs, stop the existing server or recover the update, or pair with the running environment.",
+                  ),
+                ),
               ),
             ),
-          onReady: () => Ref.set(preflightErrorRef, Option.none()),
+          onReady: () =>
+            Ref.set(ownershipRefusedRef, Option.none()).pipe(
+              Effect.andThen(Ref.set(preflightErrorRef, Option.none())),
+            ),
         })
         .pipe(
           Effect.asSome,
@@ -224,6 +234,8 @@ export const layer = Layer.effect(
         const isIdle =
           !snapshot.ready && Option.isNone(snapshot.activePid) && !snapshot.restartScheduled;
         if (isIdle) {
+          const refused = yield* Ref.get(ownershipRefusedRef);
+          if (Option.isSome(refused) && refused.value === existingInstance.id) return;
           yield* logWslBackendInfo("retrying idle WSL backend", { id: existingInstance.id });
           yield* Ref.set(preflightErrorRef, Option.none());
           yield* existingInstance.start;
@@ -235,6 +247,7 @@ export const layer = Layer.effect(
       // any stale secondary preflight error so it reflects this fresh attempt;
       // onPreflightFailed re-sets it only if the new secondary exhausts retries.
       yield* Ref.set(preflightErrorRef, Option.none());
+      yield* Ref.set(ownershipRefusedRef, Option.none());
 
       if (Option.isSome(existingId)) {
         yield* logWslBackendInfo("tearing down WSL backend", { id: existingId.value });
