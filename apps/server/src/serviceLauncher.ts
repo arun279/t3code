@@ -305,6 +305,7 @@ function terminalUpdate<S extends TerminalStatus>(input: {
     id: input.pending.id,
     fromVersion: input.pending.fromVersion,
     targetVersion: input.pending.targetVersion,
+    dbPath: input.pending.dbPath,
     status: input.status,
     ...(input.reason === undefined ? {} : { reason: input.reason }),
   };
@@ -357,7 +358,6 @@ export class Launcher {
   #stopRequested = false;
   #stopping = false;
   #done = false;
-  #ownershipRefused = false;
   #trialOwnership: ServiceLauncherContext["ownership"];
   #cliLock: Awaited<ReturnType<typeof acquireServerOwnershipLock>> | undefined;
   #launcherLock: Awaited<ReturnType<typeof acquireServerOwnershipLock>> | undefined;
@@ -380,6 +380,7 @@ export class Launcher {
           NodePath.join(this.#baseDir, "userdata"),
           { launcher: true },
         );
+        if (this.#stopRequested) this.#writeStopMarker();
         this.#state = await readServiceState(this.#statePath);
         await this.#recover();
       });
@@ -401,7 +402,6 @@ export class Launcher {
   async #handleFailure(cause: unknown): Promise<void> {
     const error = cause instanceof Error ? cause : new Error(String(cause));
     if (isOwnershipConflict(error)) {
-      if (this.#launcherLock === undefined) this.#ownershipRefused = true;
       try {
         await this.#suspendForOwnership();
       } catch (cause) {
@@ -458,12 +458,7 @@ export class Launcher {
     // ensures systemd signals the launcher before the rest of the cgroup, and
     // launchd signals only the job's main process (this launcher), so the
     // marker lands before the child sees any signal on both platforms.
-    try {
-      if (!this.#ownershipRefused)
-        NodeFS.writeFileSync(stopMarkerPath(this.#baseDir), "", { mode: 0o600 });
-    } catch {
-      // Err toward keeping the tunnel; the next link or unlink reconciles it.
-    }
+    if (this.#launcherLock !== undefined) this.#writeStopMarker();
     if (this.#stopRequested || this.#stopping) {
       await this.#completion.promise.catch(() => undefined);
       return;
@@ -492,6 +487,14 @@ export class Launcher {
     this.#timer = undefined;
   }
 
+  #writeStopMarker(): void {
+    try {
+      NodeFS.writeFileSync(stopMarkerPath(this.#baseDir), "", { mode: 0o600 });
+    } catch {
+      // Err toward keeping the tunnel; the next link or unlink reconciles it.
+    }
+  }
+
   async #recover(): Promise<void> {
     // A fresh launcher means servers are running again: any stop marker from
     // a previous explicit stop is stale and must not make a future update
@@ -511,7 +514,9 @@ export class Launcher {
     if (update?.status !== "pending") {
       if (update !== undefined) {
         const ownership = await acquireServerOwnershipLock(
-          NodePath.join(this.#baseDir, "userdata"),
+          update.dbPath === undefined
+            ? NodePath.join(this.#baseDir, "userdata")
+            : NodePath.dirname(update.dbPath),
           { guardLegacyOwner: true },
         );
         try {

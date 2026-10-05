@@ -23,7 +23,9 @@ export interface PendingServiceUpdate {
   readonly status: "pending";
 }
 
-export type ServiceUpdateRecord = PendingServiceUpdate | ServerSelfUpdateOutcome;
+export type ServiceUpdateRecord =
+  | PendingServiceUpdate
+  | (ServerSelfUpdateOutcome & { readonly dbPath?: string });
 
 export interface ServiceState {
   readonly protocol: typeof SERVICE_LAUNCHER_PROTOCOL;
@@ -98,6 +100,7 @@ function decodeServiceUpdate(value: unknown): ServiceUpdateRecord | undefined {
   }
   if (
     (status === "committed" || status === "rolled-back" || status === "failed") &&
+    (value.dbPath === undefined || (typeof value.dbPath === "string" && value.dbPath.trim() !== "")) &&
     (value.reason === undefined || (typeof value.reason === "string" && value.reason.trim() !== ""))
   ) {
     return {
@@ -105,6 +108,7 @@ function decodeServiceUpdate(value: unknown): ServiceUpdateRecord | undefined {
       fromVersion,
       targetVersion,
       status,
+      ...(typeof value.dbPath === "string" ? { dbPath: value.dbPath } : {}),
       ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
     };
   }

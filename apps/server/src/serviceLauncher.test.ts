@@ -172,6 +172,14 @@ process.exit(78);
       yield* Effect.promise(() => secondRefusal.promise);
       yield* Effect.promise(() => contender.stop("SIGTERM"));
       yield* Effect.promise(() => contenderRunning);
+      const earlyContender = new Launcher(root, {
+        protocol: SERVICE_LAUNCHER_PROTOCOL,
+        activeVersion: "1.0.0",
+      });
+      const earlyRunning = earlyContender.run();
+      const earlyStopping = earlyContender.stop("SIGTERM");
+      yield* Effect.promise(() => earlyStopping);
+      yield* Effect.promise(() => earlyRunning);
       assert.equal(yield* fs.readFileString(statePath), before);
       assert.equal(yield* fs.readFileString(startsPath), "started\n");
       assert.isFalse(yield* fs.exists(path.join(root, "runtime", SERVICE_STOP_MARKER_FILE)));
@@ -647,12 +655,11 @@ process.exit(1);
       const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
       const running = launcher.run();
       const stopping = launcher.stop("SIGTERM");
-      // An explicit stop leaves the marker that tells a child shutting down
-      // mid-update that no replacement server is coming. It is present as
-      // soon as stop() returns its promise, before queued transitions run.
-      assert.isTrue(yield* fs.exists(path.join(root, "runtime", SERVICE_STOP_MARKER_FILE)));
       yield* Effect.promise(() => stopping);
       yield* Effect.promise(() => running);
+      // An early stop writes the marker only after acquiring ownership,
+      // before recovery can start a child.
+      assert.isTrue(yield* fs.exists(path.join(root, "runtime", SERVICE_STOP_MARKER_FILE)));
     }),
   );
 
@@ -662,7 +669,7 @@ process.exit(1);
       const path = yield* Path.Path;
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-launcher-flow-" });
       const statePath = path.join(root, "runtime", "service-state.json");
-      const databasePath = path.join(root, "userdata", "state.sqlite");
+      const databasePath = path.join(root, "dev", "state.sqlite");
       yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
       yield* fs.writeFileString(databasePath, "before trial");
       // @effect-diagnostics-next-line preferSchemaOverJson:off - embeds a path in fake child source.
@@ -707,6 +714,24 @@ if (context.update?.status === "pending") {
       const state = yield* Effect.promise(() => readServiceState(statePath));
       assert.equal(state.activeVersion, "1.1.0");
       assert.equal(state.update?.status, "committed");
+      assert.equal(state.update?.dbPath, databasePath);
+      if (state.update === undefined) throw new Error("committed update missing");
+      const updateId = state.update.id;
+      const ownership = yield* Effect.promise(() =>
+        ServerOwnershipLock.acquireServerOwnershipLock(path.dirname(databasePath)),
+      );
+      try {
+        ownership.markUpdatePending(updateId);
+      } finally {
+        ownership.close();
+      }
+      const backupDir = path.join(root, "runtime", "db-backup", updateId);
+      yield* fs.makeDirectory(backupDir, { recursive: true });
+      const restarted = new Launcher(root, state);
+      yield* Effect.tryPromise(() => restarted.run()).pipe(Effect.flip);
+      assert.isFalse(yield* fs.exists(path.join(root, "dev", "server-update-pending")));
+      assert.isFalse(yield* fs.exists(backupDir));
+      assert.equal(yield* fs.readFileString(databasePath), "before trial");
     }),
   );
 
