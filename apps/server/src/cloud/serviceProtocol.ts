@@ -36,6 +36,8 @@ export interface ServiceLauncherContext {
   readonly protocol: typeof SERVICE_LAUNCHER_PROTOCOL;
   readonly childVersion: string;
   readonly update?: ServiceUpdateRecord;
+  readonly ownership?: { readonly previousOwnerId: string | null; readonly ownerId: string };
+  readonly ownershipProtocol?: 1;
 }
 
 export type ServiceLauncherChildMessage =
@@ -220,6 +222,17 @@ export function decodeServiceLauncherContext(value: string): ServiceLauncherCont
   }
   const update = parsed.update === undefined ? undefined : decodeServiceUpdate(parsed.update);
   if (parsed.update !== undefined && update === undefined) return undefined;
+  const ownership = parsed.ownership;
+  if (parsed.ownershipProtocol !== undefined && parsed.ownershipProtocol !== 1) return undefined;
+  if (
+    ownership !== undefined &&
+    (!isRecord(ownership) ||
+      !(ownership.previousOwnerId === null || typeof ownership.previousOwnerId === "string") ||
+      typeof ownership.ownerId !== "string" ||
+      ownership.ownerId.length === 0 ||
+      update?.status !== "pending")
+  )
+    return undefined;
   const selectedVersion =
     update?.status === "pending" || update?.status === "committed"
       ? update.targetVersion
@@ -232,7 +245,16 @@ export function decodeServiceLauncherContext(value: string): ServiceLauncherCont
   return {
     protocol: SERVICE_LAUNCHER_PROTOCOL,
     childVersion: parsed.childVersion,
+    ...(parsed.ownershipProtocol === 1 ? { ownershipProtocol: 1 as const } : {}),
     ...(update === undefined ? {} : { update }),
+    ...(isRecord(ownership)
+      ? {
+          ownership: {
+            previousOwnerId: ownership.previousOwnerId as string | null,
+            ownerId: ownership.ownerId as string,
+          },
+        }
+      : {}),
   };
 }
 

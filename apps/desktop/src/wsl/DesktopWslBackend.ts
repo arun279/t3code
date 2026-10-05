@@ -168,6 +168,13 @@ export const layer = Layer.effect(
           // fallback — Windows is the primary and keeps working.
           onPreflightFailed: (failure) =>
             Ref.set(preflightErrorRef, Option.some(failure.reason)).pipe(Effect.as(false)),
+          onStateDirOwned: () =>
+            Ref.set(
+              preflightErrorRef,
+              Option.some(
+                "This distro's T3 home is owned by another server or needs interrupted-update recovery. Check the server logs, stop the existing server or recover the update, or pair with the running environment.",
+              ),
+            ),
           onReady: () => Ref.set(preflightErrorRef, Option.none()),
         })
         .pipe(

@@ -301,6 +301,11 @@ export const layer = Layer.effect(
         ),
       onShutdown: () => desktopWindow.handleBackendNotReady,
       onPreflightFailed: handlePrimaryPreflightFailure,
+      onStateDirOwned: () =>
+        electronDialog.showErrorBox(
+          "This T3 home is unavailable",
+          "Another T3 Code server owns this data directory, or an interrupted service update needs recovery. Check the server logs. Finish active agent work and stop the existing server, or recover the interrupted update, then reopen the desktop. You can also use a separate T3CODE_HOME and pair with the running environment.",
+        ),
     });
 
     const instancesRef = yield* SynchronizedRef.make<

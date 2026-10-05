@@ -1,18 +1,27 @@
+// @effect-diagnostics nodeBuiltinImport:off - Inject a failed durable state rename in the real launcher.
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeFSP from "node:fs/promises";
 import { assert, it } from "@effect/vitest";
+import { SERVER_EXIT_CODE_STATE_DIR_OWNED } from "@t3tools/contracts";
+import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { Launcher, readServiceState, writeServiceState } from "./serviceLauncher.ts";
+import * as ServerOwnershipLock from "./serverOwnershipLock.ts";
+import * as ServerRuntimeState from "./serverRuntimeState.ts";
 import {
   compareExactServiceVersions,
   decodeServiceState,
   isExactServiceVersion,
+  parseServiceState,
   SERVICE_LAUNCHER_PROTOCOL,
   SERVICE_RESTART_PENDING_FILE,
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
+
+vi.mock("node:fs/promises", { spy: true });
 
 it("accepts only exact semantic versions", () => {
   for (const version of ["0.0.0", "1.2.3", "1.2.3-alpha.1", "1.2.3-0", "1.2.3+001"]) {
@@ -98,6 +107,343 @@ const writeFakeRuntime = (
   });
 
 it.layer(NodeServices.layer)("service state persistence", (it) => {
+  it.effect("preserves newer writes on restart when persisting ownership cancellation failed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-update-cancel-" });
+      const databasePath = path.join(root, "userdata", "state.sqlite");
+      const statePath = path.join(root, "runtime", "service-state.json");
+      yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+      yield* fs.writeFileString(databasePath, "old database");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - embeds the isolated database path in fake child source.
+      const database = JSON.stringify(databasePath);
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        `
+process.send({ type: "request-update", targetVersion: "1.1.0", dbPath: ${database} });
+setInterval(() => {}, 1000);
+`,
+      );
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.1.0"),
+        "process.exit(78);\n",
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+      const { rename } = yield* Effect.promise(() =>
+        vi.importActual<typeof NodeFSP>("node:fs/promises"),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.acquireRelease(
+            Effect.sync(() =>
+              vi.spyOn(NodeFSP, "rename").mockImplementation(async (from, to) => {
+                if (
+                  to === statePath &&
+                  parseServiceState(await NodeFSP.readFile(from, "utf8"))?.update?.status ===
+                    "failed"
+                )
+                  throw new Error("state rename failed");
+                return rename(from, to);
+              }),
+            ),
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
+          const launcher = new Launcher(
+            root,
+            yield* Effect.promise(() => readServiceState(statePath)),
+          );
+          const error = yield* Effect.tryPromise({
+            try: () => launcher.run(),
+            catch: String,
+          }).pipe(Effect.flip);
+          assert.include(error, "state rename failed");
+        }),
+      );
+      assert.equal(
+        (yield* Effect.promise(() => readServiceState(statePath))).update?.status,
+        "pending",
+      );
+      yield* fs.writeFileString(databasePath, "new accepted writes");
+      const restarted = new Launcher(
+        root,
+        yield* Effect.promise(() => readServiceState(statePath)),
+      );
+      const error = yield* Effect.tryPromise({
+        try: () => restarted.run(),
+        catch: String,
+      }).pipe(Effect.flip);
+      assert.include(error, "Manual recovery");
+      assert.equal(yield* fs.readFileString(databasePath), "new accepted writes");
+    }),
+  );
+  it.effect("does not roll a snapshot back over a stopped intervening owner's writes", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-update-continuity-" });
+      const databasePath = path.join(root, "userdata", "state.sqlite");
+      const statePath = path.join(root, "runtime", "service-state.json");
+      yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+      yield* fs.writeFileString(databasePath, "before trial");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fake runtime uses the production ownership boundary.
+      const lockModule = JSON.stringify(new URL("./serverOwnershipLock.ts", import.meta.url).href);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - embeds the isolated database path in fake child source.
+      const database = JSON.stringify(databasePath);
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        `
+process.send({ type: "request-update", targetVersion: "1.1.0", dbPath: ${database} });
+setInterval(() => {}, 1000);
+`,
+      );
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.1.0"),
+        `
+import { writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { acquireServerOwnershipLock } from ${lockModule};
+const context = JSON.parse(process.env.T3_SERVICE_LAUNCHER_CONTEXT);
+const owner = await acquireServerOwnershipLock(dirname(context.update.dbPath));
+owner.claim("intervening-owner");
+writeFileSync(context.update.dbPath, "foreign accepted writes");
+owner.close();
+process.exit(1);
+`,
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+      const refused = Promise.withResolvers<void>();
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+            if (String(chunk).includes("waiting for a service restart")) refused.resolve();
+            return true;
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      const running = launcher.run();
+      yield* Effect.addFinalizer(() => Effect.promise(() => launcher.stop("SIGTERM")));
+      yield* Effect.promise(() => refused.promise);
+      assert.equal(yield* fs.readFileString(databasePath), "foreign accepted writes");
+      assert.equal(
+        (yield* Effect.promise(() => readServiceState(statePath))).update?.status,
+        "failed",
+      );
+      yield* Effect.promise(() => launcher.stop("SIGTERM"));
+      yield* Effect.promise(() => running);
+    }),
+  );
+  it.effect("parks on ownership refusal until explicitly stopped instead of restarting", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-refused-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        `process.exit(${SERVER_EXIT_CODE_STATE_DIR_OWNED});\n`,
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+      const refused = Promise.withResolvers<void>();
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+            if (String(chunk).includes("waiting for a service restart")) refused.resolve();
+            return true;
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      let completed = false;
+      const running = launcher.run().finally(() => {
+        completed = true;
+      });
+      yield* Effect.addFinalizer(() => Effect.promise(() => launcher.stop("SIGTERM")));
+      yield* Effect.promise(() => refused.promise);
+      assert.isFalse(completed);
+      yield* Effect.promise(() => launcher.stop("SIGTERM"));
+      yield* Effect.promise(() => running);
+      assert.isTrue(completed);
+    }),
+  );
+
+  it.effect("refuses backup and interrupted restore beside a live database owner", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      for (const [recovery, ownerKind] of [
+        ["backup", "locked"],
+        ["restore", "locked"],
+        ["backup", "legacy"],
+        ["restore", "legacy"],
+        ["backup", "released"],
+      ] as const) {
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-owned-" });
+        const statePath = path.join(root, "runtime", "service-state.json");
+        const databasePath = path.join(root, "userdata", "state.sqlite");
+        const backupDir = path.join(root, "runtime", "db-backup", "owned-update");
+        yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+        yield* fs.writeFileString(databasePath, "live database");
+        yield* fs.writeFileString(`${databasePath}-wal`, "live wal");
+        yield* writeFakeRuntime(
+          fs,
+          path,
+          path.join(root, "runtime", "versions", "1.1.0"),
+          'throw new Error("Recovery must not start a trial beside the live owner");\n',
+        );
+        const hasBackup = recovery === "restore" || ownerKind === "released";
+        if (hasBackup) {
+          yield* fs.makeDirectory(backupDir, { recursive: true });
+          yield* fs.writeFileString(path.join(backupDir, "database"), "older backup");
+          if (recovery === "restore") {
+            yield* fs.writeFileString(path.join(backupDir, ".restore-pending"), "");
+          }
+        }
+        yield* Effect.promise(() =>
+          writeServiceState(statePath, {
+            protocol: SERVICE_LAUNCHER_PROTOCOL,
+            activeVersion: "1.0.0",
+            update: {
+              id: "owned-update",
+              fromVersion: "1.0.0",
+              targetVersion: "1.1.0",
+              dbPath: databasePath,
+              status: "pending",
+            },
+          }),
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            if (ownerKind === "locked") {
+              yield* Effect.acquireRelease(
+                Effect.promise(() =>
+                  ServerOwnershipLock.acquireServerOwnershipLock(path.dirname(databasePath)),
+                ),
+                (lock) => Effect.sync(() => lock.close()),
+              );
+            } else if (ownerKind === "released") {
+              const acquire = ServerOwnershipLock.acquireServerOwnershipLock;
+              const foreignOwner = yield* Effect.promise(() => acquire(path.dirname(databasePath)));
+              let released = false;
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  if (!released) foreignOwner.close();
+                }),
+              );
+              yield* Effect.acquireRelease(
+                Effect.sync(() =>
+                  vi
+                    .spyOn(ServerOwnershipLock, "acquireServerOwnershipLock")
+                    .mockImplementationOnce(async (...args) => {
+                      try {
+                        return await acquire(...args);
+                      } finally {
+                        // Real contention occurs, then ownership ends before
+                        // the launcher can attempt an unsafe second acquire.
+                        foreignOwner.close();
+                        released = true;
+                      }
+                    }),
+                ),
+                (spy) => Effect.sync(() => spy.mockRestore()),
+              );
+            } else {
+              yield* ServerRuntimeState.persistServerRuntimeState({
+                path: path.join(path.dirname(databasePath), "server-runtime.json"),
+                state: yield* ServerRuntimeState.makePersistedServerRuntimeState({
+                  config: { host: undefined, devUrl: undefined },
+                  port: 3773,
+                }),
+              });
+            }
+            const refused = Promise.withResolvers<void>();
+            yield* Effect.acquireRelease(
+              Effect.sync(() =>
+                vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+                  if (String(chunk).includes("waiting for a service restart")) refused.resolve();
+                  return true;
+                }),
+              ),
+              (spy) => Effect.sync(() => spy.mockRestore()),
+            );
+            const launcher = new Launcher(
+              root,
+              yield* Effect.promise(() => readServiceState(statePath)),
+            );
+            const running = launcher.run();
+            yield* Effect.addFinalizer(() => Effect.promise(() => launcher.stop("SIGTERM")));
+            yield* Effect.promise(() =>
+              Promise.race([refused.promise, running.catch(() => undefined)]),
+            );
+            assert.equal(yield* fs.readFileString(databasePath), "live database");
+            const cancelled = yield* Effect.promise(() => readServiceState(statePath));
+            assert.equal(cancelled.update?.status, hasBackup ? "pending" : "failed");
+            if (!hasBackup) {
+              assert.equal(
+                cancelled.update?.status === "failed" ? cancelled.update.reason : undefined,
+                "state-dir-owned",
+              );
+            }
+            assert.equal(yield* fs.readFileString(databasePath), "live database");
+            assert.equal(yield* fs.readFileString(`${databasePath}-wal`), "live wal");
+            assert.equal(yield* fs.exists(backupDir), hasBackup);
+            assert.isFalse(yield* fs.exists(`${backupDir}.staging`));
+            yield* Effect.promise(() => launcher.stop("SIGTERM"));
+            yield* Effect.promise(() => running.catch(() => undefined));
+          }),
+        );
+
+        // Simulate accepted foreign work before its owner stops. An explicit
+        // service restart must discard the cancelled snapshot, never restore it.
+        yield* fs.writeFileString(databasePath, "foreign owner's accepted writes");
+        yield* fs.remove(path.join(path.dirname(databasePath), "server-runtime.json"), {
+          force: true,
+        });
+        yield* writeFakeRuntime(
+          fs,
+          path,
+          path.join(root, "runtime", "versions", "1.0.0"),
+          "process.exit(1);\n",
+        );
+        const restarted = new Launcher(
+          root,
+          yield* Effect.promise(() => readServiceState(statePath)),
+        );
+        yield* Effect.tryPromise(() => restarted.run()).pipe(Effect.flip);
+        assert.equal(yield* fs.readFileString(databasePath), "foreign owner's accepted writes");
+        assert.equal(yield* fs.exists(backupDir), hasBackup);
+      }
+    }),
+  );
+
   it.effect("durably replaces and strictly reads one state document", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

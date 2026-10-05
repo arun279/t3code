@@ -39,6 +39,7 @@ import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
 import * as SqlitePersistence from "../persistence/Layers/Sqlite.ts";
+import { acquireServerOwnershipLock } from "../serverOwnershipLock.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -1127,7 +1128,28 @@ export const layer = Layer.effect(EnvironmentAuth, make).pipe(
 
 const storageLayer = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig);
 
-export const runtimeLayer = layer.pipe(
-  Layer.provideMerge(storageLayer),
-  Layer.provideMerge(ServerEnvironment.identityLayer),
+export class CliDatabaseAccessError extends Schema.TaggedError<CliDatabaseAccessError>()(
+  "CliDatabaseAccessError",
+  { stateDir: Schema.String, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return `Cannot open CLI authentication state at ${this.stateDir} while another CLI command or service update owns it. Wait for the update, or recover an interrupted update before retrying.`;
+  }
+}
+
+export const runtimeLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    yield* Effect.acquireRelease(
+      Effect.tryPromise({
+        try: () => acquireServerOwnershipLock(config.stateDir, { cli: true }),
+        catch: (cause) => new CliDatabaseAccessError({ stateDir: config.stateDir, cause }),
+      }),
+      (lock) => Effect.sync(() => lock.close()),
+    );
+    return layer.pipe(
+      Layer.provideMerge(storageLayer),
+      Layer.provideMerge(ServerEnvironment.identityLayer),
+    );
+  }),
 );

@@ -25,6 +25,8 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 
 import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Layers/Sqlite.ts";
+import * as ServerOwnership from "../serverOwnership.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import { ProjectServiceLayerLive } from "../orchestration-v2/runtimeLayer.ts";
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -370,7 +372,6 @@ const tryResolveLiveProjectExecutionMode = Effect.fn("tryResolveLiveProjectExecu
       origin: runtimeState.value.origin,
       cause: attempted.failure,
     });
-    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath);
     return Option.none<{ readonly origin: string }>();
   },
 );
@@ -421,16 +422,22 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
       Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
     );
 
-    return yield* Effect.gen(function* () {
-      const snapshot = yield* getOfflineSnapshot();
-      const projects = yield* ProjectService.ProjectService;
-      const output = yield* run({
-        snapshot,
-        dispatch: (command) => projectMutationOperation(projects, command).pipe(Effect.asVoid),
-        mode: "offline",
-      });
-      yield* Console.log(output);
-    }).pipe(Effect.provide(offlineRuntimeLayer));
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* ServerOwnership.acquireServerOwnership(config.serverRuntimeStatePath);
+        yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath);
+        return yield* Effect.gen(function* () {
+          const snapshot = yield* getOfflineSnapshot();
+          const projects = yield* ProjectService.ProjectService;
+          const output = yield* run({
+            snapshot,
+            dispatch: (command) => projectMutationOperation(projects, command).pipe(Effect.asVoid),
+            mode: "offline",
+          });
+          yield* Console.log(output);
+        }).pipe(Effect.provide(offlineRuntimeLayer));
+      }),
+    ).pipe(Effect.provide(ProcessRunner.layer));
   }).pipe(
     Effect.provide(
       Layer.mergeAll(EnvironmentAuth.runtimeLayer, WorkspacePaths.layer).pipe(
