@@ -10,6 +10,7 @@ import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import { acquireServerOwnershipLock } from "./serverOwnershipLock.ts";
+import { decodeServicePreflightResult } from "./cloud/servicePreflight.ts";
 
 import type {
   PendingServiceUpdate,
@@ -70,6 +71,42 @@ const runtimeSpawnArguments = (paths: ReturnType<typeof runtimePaths>) => ({
   command: paths.entryPath,
   args: ["serve"],
 });
+
+/** This command reports capabilities without opening application persistence. */
+async function runtimeSupportsOwnership(
+  baseDir: string,
+  version: string,
+  dbPath: string,
+): Promise<boolean> {
+  const env = { ...process.env };
+  delete env[SERVICE_LAUNCHER_CONTEXT_ENV];
+  return new Promise((resolve) => {
+    NodeChildProcess.execFile(
+      runtimePaths(baseDir, version).entryPath,
+      [
+        "__service-preflight",
+        "--database-path",
+        dbPath,
+        "--launcher-protocol",
+        String(SERVICE_LAUNCHER_PROTOCOL),
+      ],
+      { env, timeout: 15_000, maxBuffer: 16_384 },
+      (error, stdout) => {
+        if (error !== null) return resolve(false);
+        try {
+          const result = decodeServicePreflightResult(JSON.parse(stdout));
+          resolve(
+            result?.status === "ready" &&
+              result.version === version &&
+              result.ownershipProtocol === 1,
+          );
+        } catch {
+          resolve(false);
+        }
+      },
+    );
+  });
+}
 
 /** SQLite persists across the main file plus its WAL and shared-memory sidecars. */
 const DB_FILE_SUFFIXES = ["", "-wal", "-shm"] as const;
@@ -320,8 +357,10 @@ export class Launcher {
   #stopRequested = false;
   #stopping = false;
   #done = false;
+  #ownershipRefused = false;
   #trialOwnership: ServiceLauncherContext["ownership"];
   #cliLock: Awaited<ReturnType<typeof acquireServerOwnershipLock>> | undefined;
+  #launcherLock: Awaited<ReturnType<typeof acquireServerOwnershipLock>> | undefined;
   readonly #completion = Promise.withResolvers<void>();
 
   constructor(baseDir: string, state: ServiceState) {
@@ -336,11 +375,20 @@ export class Launcher {
     process.once("SIGTERM", onSigterm);
     process.once("SIGINT", onSigint);
     try {
-      this.#enqueue(() => this.#recover());
+      this.#enqueue(async () => {
+        this.#launcherLock = await acquireServerOwnershipLock(
+          NodePath.join(this.#baseDir, "userdata"),
+          { launcher: true },
+        );
+        this.#state = await readServiceState(this.#statePath);
+        await this.#recover();
+      });
       await this.#completion.promise;
     } finally {
       process.off("SIGTERM", onSigterm);
       process.off("SIGINT", onSigint);
+      this.#launcherLock?.close();
+      this.#launcherLock = undefined;
     }
   }
 
@@ -353,6 +401,7 @@ export class Launcher {
   async #handleFailure(cause: unknown): Promise<void> {
     const error = cause instanceof Error ? cause : new Error(String(cause));
     if (isOwnershipConflict(error)) {
+      if (this.#launcherLock === undefined) this.#ownershipRefused = true;
       try {
         await this.#suspendForOwnership();
       } catch (cause) {
@@ -366,7 +415,7 @@ export class Launcher {
   async #suspendForOwnership(): Promise<void> {
     this.#clearTimer();
     const pending = this.#state.update;
-    if (pending?.status === "pending") {
+    if (pending?.status === "pending" && this.#launcherLock !== undefined) {
       // Another owner may have written since the backup. Cancel this trial
       // without restoring it; an explicit restart must never replay that
       // stale snapshot over the intervening owner's accepted writes.
@@ -410,7 +459,8 @@ export class Launcher {
     // launchd signals only the job's main process (this launcher), so the
     // marker lands before the child sees any signal on both platforms.
     try {
-      NodeFS.writeFileSync(stopMarkerPath(this.#baseDir), "", { mode: 0o600 });
+      if (!this.#ownershipRefused)
+        NodeFS.writeFileSync(stopMarkerPath(this.#baseDir), "", { mode: 0o600 });
     } catch {
       // Err toward keeping the tunnel; the next link or unlink reconciles it.
     }
@@ -450,7 +500,8 @@ export class Launcher {
     // the version the marker waits for: a launcher that came up between the
     // CLI writing the marker and writing the new state still runs the old
     // version, and the marker has to outlive it.
-    await NodeFSP.rm(stopMarkerPath(this.#baseDir), { force: true }).catch(() => undefined);
+    if (!this.#stopRequested)
+      await NodeFSP.rm(stopMarkerPath(this.#baseDir), { force: true }).catch(() => undefined);
     const restartPending = restartPendingPath(this.#baseDir);
     const awaitedVersion = await NodeFSP.readFile(restartPending, "utf8").catch(() => undefined);
     if (awaitedVersion?.trim() === this.#state.activeVersion) {
@@ -488,6 +539,10 @@ export class Launcher {
   }
 
   async #startTrial(pending: PendingServiceUpdate): Promise<void> {
+    if (!(await runtimeSupportsOwnership(this.#baseDir, pending.targetVersion, pending.dbPath))) {
+      await this.#returnToPrevious(pending, "failed", "ownership-protocol-unavailable");
+      return;
+    }
     // The previous child is dead here, so all three SQLite files are quiescent.
     try {
       this.#cliLock = await acquireServerOwnershipLock(NodePath.dirname(pending.dbPath), {
@@ -607,6 +662,10 @@ export class Launcher {
     }
     if (!(await runtimeExists(this.#baseDir, message.targetVersion))) {
       await reject("The requested target runtime is missing or incomplete.");
+      return;
+    }
+    if (!(await runtimeSupportsOwnership(this.#baseDir, message.targetVersion, message.dbPath))) {
+      await reject("The requested runtime does not support safe database ownership.");
       return;
     }
 

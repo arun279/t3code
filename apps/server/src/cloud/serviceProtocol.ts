@@ -191,6 +191,22 @@ export function serviceStateHasPendingUpdate(value: string): boolean {
   }
 }
 
+/** Find a safe backup directory name across launcher protocol revisions. */
+export function serviceStatePendingUpdateId(value: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) &&
+      isRecord(parsed.update) &&
+      parsed.update.status === "pending" &&
+      typeof parsed.update.id === "string" &&
+      /^[a-zA-Z0-9_-]+$/.test(parsed.update.id)
+      ? parsed.update.id
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Reads the active version across launcher protocol revisions for downgrade protection. */
 export function serviceStateActiveVersion(value: string): string | undefined {
   try {

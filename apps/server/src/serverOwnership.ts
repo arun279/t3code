@@ -13,7 +13,10 @@ import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "./processRunner.ts";
 import { acquireServerOwnershipLock, SERVER_UPDATE_RECOVERY_FILE } from "./serverOwnershipLock.ts";
-import { parseServiceState } from "./cloud/serviceProtocol.ts";
+import {
+  serviceStateHasPendingUpdate,
+  serviceStatePendingUpdateId,
+} from "./cloud/serviceProtocol.ts";
 
 import {
   isProcessAlive,
@@ -79,10 +82,11 @@ const requireNoInterruptedRestore = (statePath: string) =>
         if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return;
         throw cause;
       }
-      const state = parseServiceState(contents);
+      const updateId = serviceStatePendingUpdateId(contents);
       if (
-        state?.update?.status === "pending" &&
-        NodeFS.existsSync(NodePath.join(runtimeDir, "db-backup", state.update.id))
+        serviceStateHasPendingUpdate(contents) &&
+        (updateId === undefined ||
+          NodeFS.existsSync(NodePath.join(runtimeDir, "db-backup", updateId)))
       ) {
         throw new ServerUpdateRecoveryRequiredError({ statePath: runtimeDir });
       }

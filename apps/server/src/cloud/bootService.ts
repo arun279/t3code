@@ -847,11 +847,9 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
       yield* runSteps(manager.stop);
     }
 
-    // Stopping the unit does not stop an unmanaged desktop, SSH, or CLI server.
-    // Updating only installed launcher files with start=false remains allowed.
-    if (!installed || start) yield* requireStopped;
-
     yield* Effect.gen(function* () {
+      // Keep a stopped unit recoverable if an unmanaged server wins the handoff.
+      if (!installed || start) yield* requireStopped;
       if (installed) {
         const previousStateText = yield* fs.readFileString(statePath).pipe(Effect.option);
         if (Option.isSome(previousStateText)) {
@@ -936,8 +934,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
       return false;
     }
     yield* runSteps(manager.stop);
-    yield* requireStopped;
-    yield* runSteps(manager.activate).pipe(
+    yield* requireStopped.pipe(Effect.andThen(runSteps(manager.activate))).pipe(
       // Same recovery as a failed repair: a service that was running should
       // not be left stopped because daemon-reload or enable failed.
       Effect.tapError(() => runSteps(manager.restart).pipe(Effect.ignore)),

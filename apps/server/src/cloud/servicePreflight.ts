@@ -6,6 +6,7 @@ export type ServicePreflightResult =
       readonly status: "ready";
       readonly version: string;
       readonly launcherProtocol: typeof SERVICE_LAUNCHER_PROTOCOL;
+      readonly ownershipProtocol?: 1;
     }
   | {
       readonly status: "blocked";
@@ -29,7 +30,12 @@ export function runServicePreflight(input: {
     };
   }
 
-  return { status: "ready", version, launcherProtocol: SERVICE_LAUNCHER_PROTOCOL };
+  return {
+    status: "ready",
+    version,
+    launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
+    ownershipProtocol: 1,
+  };
 }
 
 export function decodeServicePreflightResult(value: unknown): ServicePreflightResult | undefined {
@@ -46,6 +52,7 @@ export function decodeServicePreflightResult(value: unknown): ServicePreflightRe
       status: "ready",
       version: record.version,
       launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
+      ...(record.ownershipProtocol === 1 ? { ownershipProtocol: 1 as const } : {}),
     };
   }
   if (

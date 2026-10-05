@@ -54,10 +54,21 @@ describe("serverRuntimeState", () => {
             },
           }),
         );
-        const error = yield* Effect.scoped(
-          ServerOwnership.acquireServerOwnership(path.join(stateDir, "server-runtime.json")),
-        ).pipe(Effect.flip);
-        assert.equal(error._tag, "ServerUpdateRecoveryRequiredError");
+        const stateFile = path.join(root, "runtime", "service-state.json");
+        const stateContents = yield* fs.readFileString(stateFile);
+        for (const protocol of [1, 2, 3, 4]) {
+          yield* fs.writeFileString(
+            stateFile,
+            stateContents.replace(/"protocol":\s*3/, `"protocol":${protocol}`),
+          );
+          const error = yield* Effect.scoped(
+            ServerOwnership.acquireServerOwnership(path.join(stateDir, "server-runtime.json")),
+          ).pipe(Effect.flip);
+          assert.equal(error._tag, "ServerUpdateRecoveryRequiredError");
+          yield* Effect.tryPromise(() => acquireServerOwnershipLock(stateDir, { cli: true })).pipe(
+            Effect.flip,
+          );
+        }
         const aliasHome = path.join(root, "alias-home");
         yield* fs.makeDirectory(aliasHome);
         yield* Effect.sync(() =>

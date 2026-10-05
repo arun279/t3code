@@ -4,7 +4,10 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
-import { parseServiceState } from "./cloud/serviceProtocol.ts";
+import {
+  serviceStateHasPendingUpdate,
+  serviceStatePendingUpdateId,
+} from "./cloud/serviceProtocol.ts";
 
 export const SERVER_UPDATE_RECOVERY_FILE = "server-update-pending";
 
@@ -22,13 +25,21 @@ const syncStateDirectory = (stateDir: string) => {
 /** Never unlink this file. SQLite releases its OS lock when the holder exits. */
 export async function acquireServerOwnershipLock(
   directory: string,
-  options?: { readonly guardLegacyOwner?: boolean; readonly cli?: boolean },
+  options?: {
+    readonly guardLegacyOwner?: boolean;
+    readonly cli?: boolean;
+    readonly launcher?: boolean;
+  },
 ) {
   await NodeFSP.mkdir(directory, { recursive: true });
   const stateDir = await NodeFSP.realpath(directory);
   const lockPath = NodePath.join(
     stateDir,
-    options?.cli ? "server-cli.sqlite" : "server-owner.sqlite",
+    options?.cli
+      ? "server-cli.sqlite"
+      : options?.launcher
+        ? "server-launcher.sqlite"
+        : "server-owner.sqlite",
   );
   let db: { exec: (sql: string) => unknown; close: () => void };
   if (process.versions.bun) {
@@ -46,21 +57,31 @@ export async function acquireServerOwnershipLock(
       if (NodeFS.existsSync(NodePath.join(stateDir, SERVER_UPDATE_RECOVERY_FILE))) {
         throw new Error("An interrupted update requires manual recovery before CLI access.");
       }
-      let contents: string | undefined;
-      const runtimeDir = NodePath.join(NodePath.dirname(stateDir), "runtime");
-      try {
-        contents = await NodeFSP.readFile(NodePath.join(runtimeDir, "service-state.json"), "utf8");
-      } catch (cause) {
-        if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
-      }
-      const state = contents === undefined ? undefined : parseServiceState(contents);
-      if (
-        state?.update?.status === "pending" &&
-        NodeFS.existsSync(NodePath.join(runtimeDir, "db-backup", state.update.id))
-      ) {
-        throw new Error(
-          "An interrupted update has an existing database backup. Manual recovery is required; no database files were restored.",
-        );
+      for (const parent of new Set([
+        NodePath.dirname(stateDir),
+        NodePath.dirname(NodePath.resolve(directory)),
+      ])) {
+        let contents: string | undefined;
+        const runtimeDir = NodePath.join(parent, "runtime");
+        try {
+          contents = await NodeFSP.readFile(
+            NodePath.join(runtimeDir, "service-state.json"),
+            "utf8",
+          );
+        } catch (cause) {
+          if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+        }
+        const updateId = contents === undefined ? undefined : serviceStatePendingUpdateId(contents);
+        if (
+          contents !== undefined &&
+          serviceStateHasPendingUpdate(contents) &&
+          (updateId === undefined ||
+            NodeFS.existsSync(NodePath.join(runtimeDir, "db-backup", updateId)))
+        ) {
+          throw new Error(
+            "An interrupted update has an existing database backup. Manual recovery is required; no database files were restored.",
+          );
+        }
       }
     }
     if (options?.guardLegacyOwner) {

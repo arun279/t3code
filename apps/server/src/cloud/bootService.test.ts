@@ -252,6 +252,29 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
 });
 
 it.layer(NodeServices.layer)("boot service install", (it) => {
+  it.effect("restarts the stopped unit when another owner blocks install or restart", () =>
+    Effect.gen(function* () {
+      const { service, statePath, commands } = yield* makeHarness();
+      const path = yield* Path.Path;
+      yield* service.install();
+      yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          acquireServerOwnershipLock(path.join(path.dirname(path.dirname(statePath)), "userdata")),
+        ),
+        (lock) => Effect.sync(() => lock.close()),
+      );
+      for (const action of [
+        service.install().pipe(Effect.asVoid),
+        service.restart.pipe(Effect.asVoid),
+      ]) {
+        commands.length = 0;
+        const error = yield* action.pipe(Effect.flip);
+        expect(error._tag).toBe("ServerAlreadyRunningError");
+        expect(commands).toContain("systemctl --user stop t3code.service");
+        expect(commands).toContain("systemctl --user restart t3code.service");
+      }
+    }),
+  );
   it.effect("refuses a fresh install beside an active state-directory owner", () =>
     Effect.gen(function* () {
       const { service, fs, statePath, commands } = yield* makeHarness();

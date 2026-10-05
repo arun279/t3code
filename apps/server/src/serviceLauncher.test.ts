@@ -93,11 +93,15 @@ const writeFakeRuntime = (
   path: Path.Path,
   versionDir: string,
   childSource: string,
+  ownershipProtocol = true,
 ) =>
   Effect.gen(function* () {
     const entryPath = path.join(versionDir, "t3");
     yield* fs.makeDirectory(versionDir, { recursive: true });
-    yield* fs.writeFileString(entryPath, `#!${process.execPath}\n${childSource}`);
+    yield* fs.writeFileString(
+      entryPath,
+      `#!${process.execPath}\nif(process.argv[2] === "__service-preflight") { console.log(JSON.stringify({status:"ready",version:"${path.basename(versionDir)}",launcherProtocol:3${ownershipProtocol ? ",ownershipProtocol:1" : ""}})); process.exit(0); }\n${childSource}`,
+    );
     yield* fs.chmod(entryPath, 0o755);
     yield* fs.writeFileString(
       path.join(versionDir, ".install-complete"),
@@ -107,6 +111,123 @@ const writeFakeRuntime = (
   });
 
 it.layer(NodeServices.layer)("service state persistence", (it) => {
+  it.effect("parks a competing launcher without changing service state or stop markers", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-launcher-contender-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const startsPath = path.join(root, "starts");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - isolated path embedded in a real child process.
+      const starts = JSON.stringify(startsPath);
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        `
+import { appendFileSync } from "node:fs";
+appendFileSync(${starts}, "started\\n");
+process.exit(78);
+`,
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+      const firstRefusal = Promise.withResolvers<void>();
+      const secondRefusal = Promise.withResolvers<void>();
+      let refusals = 0;
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+            if (String(chunk).includes("waiting for a service restart")) {
+              if (++refusals === 1) firstRefusal.resolve();
+              else secondRefusal.resolve();
+            }
+            return true;
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const owner = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      const ownerRunning = owner.run();
+      yield* Effect.addFinalizer(() => Effect.promise(() => owner.stop("SIGTERM")));
+      yield* Effect.promise(() => firstRefusal.promise);
+      const before = yield* fs.readFileString(statePath);
+      const contender = new Launcher(root, {
+        protocol: SERVICE_LAUNCHER_PROTOCOL,
+        activeVersion: "1.0.0",
+        update: {
+          id: "stale-update",
+          fromVersion: "1.0.0",
+          targetVersion: "1.1.0",
+          dbPath: path.join(root, "userdata", "state.sqlite"),
+          status: "pending",
+        },
+      });
+      const contenderRunning = contender.run();
+      yield* Effect.addFinalizer(() => Effect.promise(() => contender.stop("SIGTERM")));
+      yield* Effect.promise(() => secondRefusal.promise);
+      yield* Effect.promise(() => contender.stop("SIGTERM"));
+      yield* Effect.promise(() => contenderRunning);
+      assert.equal(yield* fs.readFileString(statePath), before);
+      assert.equal(yield* fs.readFileString(startsPath), "started\n");
+      assert.isFalse(yield* fs.exists(path.join(root, "runtime", SERVICE_STOP_MARKER_FILE)));
+      yield* Effect.promise(() => owner.stop("SIGTERM"));
+      yield* Effect.promise(() => ownerRunning);
+    }),
+  );
+  it.effect("rejects a target that does not acknowledge ownership before snapshotting", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-update-capability-" });
+      const databasePath = path.join(root, "userdata", "state.sqlite");
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const rejectedPath = path.join(root, "rejected");
+      yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+      yield* fs.writeFileString(databasePath, "original database");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - isolated paths embedded in a real child process.
+      const database = JSON.stringify(databasePath);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - isolated paths embedded in a real child process.
+      const rejected = JSON.stringify(rejectedPath);
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        `
+import { writeFileSync } from "node:fs";
+process.on("message", (message) => { if(message.type === "update-rejected") { writeFileSync(${rejected}, message.reason); process.exit(0); }});
+process.send({type:"request-update",targetVersion:"1.1.0",dbPath:${database}});
+setInterval(() => {}, 1000);
+`,
+      );
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.1.0"),
+        "throw new Error('unsupported runtime must not start');",
+        false,
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      yield* Effect.tryPromise(() => launcher.run()).pipe(Effect.flip);
+      assert.include(
+        yield* fs.readFileString(rejectedPath),
+        "does not support safe database ownership",
+      );
+      assert.equal(yield* fs.readFileString(databasePath), "original database");
+      assert.isFalse(yield* fs.exists(path.join(root, "runtime", "db-backup")));
+      assert.isUndefined((yield* Effect.promise(() => readServiceState(statePath))).update);
+    }),
+  );
   it.effect("preserves newer writes on restart when persisting ownership cancellation failed", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
