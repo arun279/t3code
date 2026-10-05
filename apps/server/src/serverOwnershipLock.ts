@@ -6,6 +6,19 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { parseServiceState } from "./cloud/serviceProtocol.ts";
 
+export const SERVER_UPDATE_RECOVERY_FILE = "server-update-pending";
+
+const syncStateDirectory = (stateDir: string) => {
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone launcher lock cannot depend on the Effect runtime.
+  if (process.platform === "win32") return;
+  const directory = NodeFS.openSync(stateDir, "r");
+  try {
+    NodeFS.fsyncSync(directory);
+  } finally {
+    NodeFS.closeSync(directory);
+  }
+};
+
 /** Never unlink this file. SQLite releases its OS lock when the holder exits. */
 export async function acquireServerOwnershipLock(
   directory: string,
@@ -30,6 +43,9 @@ export async function acquireServerOwnershipLock(
   try {
     db.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE;");
     if (options?.cli) {
+      if (NodeFS.existsSync(NodePath.join(stateDir, SERVER_UPDATE_RECOVERY_FILE))) {
+        throw new Error("An interrupted update requires manual recovery before CLI access.");
+      }
       let contents: string | undefined;
       const runtimeDir = NodePath.join(NodePath.dirname(stateDir), "runtime");
       try {
@@ -99,6 +115,29 @@ export async function acquireServerOwnershipLock(
   return {
     stateDir,
     close: () => db.close(),
+    markUpdatePending: (updateId: string) => {
+      const fd = NodeFS.openSync(NodePath.join(stateDir, SERVER_UPDATE_RECOVERY_FILE), "wx", 0o600);
+      try {
+        NodeFS.writeFileSync(fd, `${updateId}\n`);
+        NodeFS.fsyncSync(fd);
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+      syncStateDirectory(stateDir);
+    },
+    clearUpdatePending: (updateId: string) => {
+      const marker = NodePath.join(stateDir, SERVER_UPDATE_RECOVERY_FILE);
+      let contents: string;
+      try {
+        contents = NodeFS.readFileSync(marker, "utf8");
+      } catch (cause) {
+        if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return;
+        throw cause;
+      }
+      if (contents.trim() !== updateId) throw new Error("Another update requires recovery.");
+      NodeFS.rmSync(marker);
+      syncStateDirectory(stateDir);
+    },
     readOwnerId: () => {
       try {
         const value: unknown = JSON.parse(
@@ -126,16 +165,7 @@ export async function acquireServerOwnershipLock(
           NodeFS.closeSync(fd);
         }
         NodeFS.renameSync(temporary, target);
-        // Windows does not support opening a directory for fsync.
-        // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone launcher lock cannot depend on the Effect runtime.
-        if (process.platform !== "win32") {
-          const directory = NodeFS.openSync(stateDir, "r");
-          try {
-            NodeFS.fsyncSync(directory);
-          } finally {
-            NodeFS.closeSync(directory);
-          }
-        }
+        syncStateDirectory(stateDir);
       } finally {
         NodeFS.rmSync(temporary, { force: true });
       }

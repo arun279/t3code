@@ -134,6 +134,9 @@ async function backupDatabaseOnce(
         "An interrupted update has an existing database backup. Manual recovery is required; no database files were restored.",
       );
 
+    // Every home alias must see recovery state before a trial can change data.
+    ownership.markUpdatePending(pending.id);
+
     const stagingDir = `${backupDir}.staging`;
     await NodeFSP.rm(stagingDir, { recursive: true, force: true });
     await NodeFSP.mkdir(stagingDir, { recursive: true, mode: 0o700 });
@@ -362,8 +365,6 @@ export class Launcher {
 
   async #suspendForOwnership(): Promise<void> {
     this.#clearTimer();
-    this.#cliLock?.close();
-    this.#cliLock = undefined;
     const pending = this.#state.update;
     if (pending?.status === "pending") {
       // Another owner may have written since the backup. Cancel this trial
@@ -375,7 +376,10 @@ export class Launcher {
       };
       await writeServiceState(this.#statePath, next);
       this.#state = next;
+      this.#cliLock?.clearUpdatePending(pending.id);
     }
+    this.#cliLock?.close();
+    this.#cliLock = undefined;
     if (this.#stopRequested || this.#stopping) return;
     // A Promise and signal listeners do not keep standalone Node alive.
     // Keep one referenced idle handle; stop/fatal both clear it.
@@ -455,6 +459,15 @@ export class Launcher {
     const update = this.#state.update;
     if (update?.status !== "pending") {
       if (update !== undefined) {
+        const ownership = await acquireServerOwnershipLock(
+          NodePath.join(this.#baseDir, "userdata"),
+          { guardLegacyOwner: true },
+        );
+        try {
+          ownership.clearUpdatePending(update.id);
+        } finally {
+          ownership.close();
+        }
         await discardDatabaseBackup(this.#baseDir, update.id).catch(() => undefined);
       }
       await this.#startChild(this.#state.activeVersion, "active", update);
@@ -645,6 +658,7 @@ export class Launcher {
     };
     await writeServiceState(this.#statePath, next);
     this.#state = next;
+    this.#cliLock?.clearUpdatePending(pending.id);
     child.role = "active";
     this.#cliLock?.close();
     this.#cliLock = undefined;
@@ -722,6 +736,7 @@ export class Launcher {
     };
     await writeServiceState(this.#statePath, next);
     this.#state = next;
+    this.#cliLock?.clearUpdatePending(pending.id);
     await discardDatabaseBackup(this.#baseDir, pending.id).catch(() => undefined);
     this.#cliLock?.close();
     this.#cliLock = undefined;

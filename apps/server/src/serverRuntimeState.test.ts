@@ -58,9 +58,34 @@ describe("serverRuntimeState", () => {
           ServerOwnership.acquireServerOwnership(path.join(stateDir, "server-runtime.json")),
         ).pipe(Effect.flip);
         assert.equal(error._tag, "ServerUpdateRecoveryRequiredError");
+        const aliasHome = path.join(root, "alias-home");
+        yield* fs.makeDirectory(aliasHome);
+        yield* Effect.sync(() =>
+          NodeFS.symlinkSync(stateDir, path.join(aliasHome, "userdata"), "junction"),
+        );
+        const aliasError = yield* Effect.scoped(
+          ServerOwnership.acquireServerOwnership(
+            path.join(aliasHome, "userdata", "server-runtime.json"),
+          ),
+        ).pipe(Effect.flip);
+        assert.equal(aliasError._tag, "ServerUpdateRecoveryRequiredError");
         yield* Effect.tryPromise(() => acquireServerOwnershipLock(stateDir, { cli: true })).pipe(
           Effect.flip,
         );
+        const markerLock = yield* Effect.promise(() => acquireServerOwnershipLock(stateDir));
+        markerLock.markUpdatePending("update-1");
+        markerLock.close();
+        // Model a launcher whose runtime lives outside the canonical home's parent.
+        yield* fs.rename(path.join(root, "runtime"), path.join(root, "other-runtime"));
+        const markerError = yield* Effect.scoped(
+          ServerOwnership.acquireServerOwnership(
+            path.join(aliasHome, "userdata", "server-runtime.json"),
+          ),
+        ).pipe(Effect.flip);
+        assert.equal(markerError._tag, "ServerUpdateRecoveryRequiredError");
+        yield* Effect.tryPromise(() =>
+          acquireServerOwnershipLock(path.join(aliasHome, "userdata"), { cli: true }),
+        ).pipe(Effect.flip);
         const lock = yield* Effect.acquireRelease(
           Effect.promise(() => acquireServerOwnershipLock(stateDir)),
           (value) => Effect.sync(() => value.close()),

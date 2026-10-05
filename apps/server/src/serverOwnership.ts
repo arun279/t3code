@@ -12,7 +12,7 @@ import * as Runtime from "effect/Runtime";
 import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "./processRunner.ts";
-import { acquireServerOwnershipLock } from "./serverOwnershipLock.ts";
+import { acquireServerOwnershipLock, SERVER_UPDATE_RECOVERY_FILE } from "./serverOwnershipLock.ts";
 import { parseServiceState } from "./cloud/serviceProtocol.ts";
 
 import {
@@ -58,7 +58,7 @@ export class ServerUpdateRecoveryRequiredError extends Schema.TaggedError<Server
 ) {
   override readonly [Runtime.errorExitCode] = SERVER_EXIT_CODE_STATE_DIR_OWNED;
   override get message(): string {
-    return `An interrupted server update has a database backup at ${this.statePath}. Recover the database and service state before restarting. No database files were restored.`;
+    return `An interrupted server update requires recovery at ${this.statePath}. Recover the database and service state before restarting. No database files were restored.`;
   }
 }
 
@@ -67,6 +67,10 @@ const isServerUpdateRecoveryRequiredError = Schema.is(ServerUpdateRecoveryRequir
 const requireNoInterruptedRestore = (statePath: string) =>
   Effect.try({
     try: () => {
+      const marker = NodePath.join(NodePath.dirname(statePath), SERVER_UPDATE_RECOVERY_FILE);
+      if (NodeFS.existsSync(marker)) {
+        throw new ServerUpdateRecoveryRequiredError({ statePath: marker });
+      }
       const runtimeDir = NodePath.join(NodePath.dirname(NodePath.dirname(statePath)), "runtime");
       let contents: string;
       try {
@@ -183,7 +187,9 @@ export const acquireServerOwnership = Effect.fn("acquireServerOwnership")(functi
       ),
   );
 
-  if (trial === undefined) yield* requireNoInterruptedRestore(statePath);
+  if (trial === undefined) yield* requireNoInterruptedRestore(resource.path);
+  if (trial === undefined && statePath !== resource.path)
+    yield* requireNoInterruptedRestore(statePath);
 
   // Older releases have no lock. Do not replace their record while their PID
   // still identifies that process. New records with a free lock belong to a
