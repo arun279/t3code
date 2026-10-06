@@ -346,22 +346,21 @@ const getOfflineSnapshot = Effect.fn("getOfflineSnapshot")(function* () {
 });
 
 const tryResolveLiveProjectExecutionMode = Effect.fn("tryResolveLiveProjectExecutionMode")(
-  function* (
-    environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"],
-    config: ServerConfig.ServerConfig["Service"],
-  ) {
+  function* (config: ServerConfig.ServerConfig["Service"]) {
     const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
-    if (Option.isNone(runtimeState)) {
+    const fs = yield* FileSystem.FileSystem;
+    if (Option.isNone(runtimeState) || !(yield* fs.exists(config.dbPath))) {
       return Option.none<{ readonly origin: string }>();
     }
 
-    const attempt = withProjectCliSessionToken(environmentAuth, (token) =>
-      fetchLiveOrchestrationSnapshot(runtimeState.value.origin, token).pipe(
-        Effect.as({
-          origin: runtimeState.value.origin,
-        }),
-      ),
-    );
+    const attempt = Effect.gen(function* () {
+      const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      return yield* withProjectCliSessionToken(environmentAuth, (token) =>
+        fetchLiveOrchestrationSnapshot(runtimeState.value.origin, token).pipe(
+          Effect.as({ origin: runtimeState.value.origin }),
+        ),
+      );
+    }).pipe(Effect.provide(EnvironmentAuth.layerRuntimeExistingDatabase));
 
     const attempted = yield* Effect.result(attempt);
     if (attempted._tag === "Success") {
@@ -399,22 +398,24 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
   const minimumLogLevel = config.logLevel;
 
   return yield* Effect.gen(function* () {
-    const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
-    const liveMode = yield* tryResolveLiveProjectExecutionMode(environmentAuth, config);
+    const liveMode = yield* tryResolveLiveProjectExecutionMode(config);
 
     if (Option.isSome(liveMode)) {
-      return yield* withProjectCliSessionToken(environmentAuth, (token) =>
-        Effect.gen(function* () {
-          const snapshot = yield* fetchLiveOrchestrationSnapshot(liveMode.value.origin, token);
-          const output = yield* run({
-            snapshot,
-            dispatch: (command) =>
-              dispatchLiveOrchestrationCommand(liveMode.value.origin, token, command),
-            mode: "live",
-          });
-          yield* Console.log(output);
-        }),
-      );
+      return yield* Effect.gen(function* () {
+        const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+        return yield* withProjectCliSessionToken(environmentAuth, (token) =>
+          Effect.gen(function* () {
+            const snapshot = yield* fetchLiveOrchestrationSnapshot(liveMode.value.origin, token);
+            const output = yield* run({
+              snapshot,
+              dispatch: (command) =>
+                dispatchLiveOrchestrationCommand(liveMode.value.origin, token, command),
+              mode: "live",
+            });
+            yield* Console.log(output);
+          }),
+        );
+      }).pipe(Effect.provide(EnvironmentAuth.layerRuntimeExistingDatabase));
     }
 
     const layerOfflineRuntime = layerProjectCliRuntime.pipe(
@@ -440,9 +441,9 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
     ).pipe(Effect.provide(ProcessRunner.layer));
   }).pipe(
     Effect.provide(
-      Layer.mergeAll(EnvironmentAuth.layerRuntime, WorkspacePaths.layer).pipe(
+      WorkspacePaths.layer.pipe(
         Layer.provideMerge(FetchHttpClient.layer),
-        Layer.provide(ServerConfig.layer(config)),
+        Layer.provideMerge(ServerConfig.layer(config)),
         Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
       ),
     ),

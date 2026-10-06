@@ -1126,8 +1126,6 @@ export const layer = Layer.effect(EnvironmentAuth, make).pipe(
   Layer.provideMerge(EnvironmentAuthPolicy.layer),
 );
 
-const layerStorage = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig);
-
 export class CliDatabaseAccessError extends Schema.TaggedError<CliDatabaseAccessError>()(
   "CliDatabaseAccessError",
   { stateDir: Schema.String, cause: Schema.Defect() },
@@ -1137,19 +1135,30 @@ export class CliDatabaseAccessError extends Schema.TaggedError<CliDatabaseAccess
   }
 }
 
-export const layerRuntime = Layer.unwrap(
-  Effect.gen(function* () {
-    const config = yield* ServerConfig.ServerConfig;
-    yield* Effect.acquireRelease(
-      Effect.tryPromise({
-        try: () => acquireServerOwnershipLock(config.stateDir, { cli: true }),
-        catch: (cause) => new CliDatabaseAccessError({ stateDir: config.stateDir, cause }),
-      }),
-      (lock) => Effect.sync(() => lock.close()),
-    );
-    return layer.pipe(
-      Layer.provideMerge(layerStorage),
-      Layer.provideMerge(ServerEnvironment.layerIdentity),
-    );
-  }),
-);
+const makeLayerRuntime = (existingDatabase: boolean) =>
+  Layer.unwrap(
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () => acquireServerOwnershipLock(config.stateDir, { cli: true }),
+          catch: (cause) => new CliDatabaseAccessError({ stateDir: config.stateDir, cause }),
+        }),
+        (lock) => Effect.sync(() => lock.close()),
+      );
+      return layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            ServerSecretStore.layer,
+            existingDatabase
+              ? SqlitePersistence.layerExistingConfig
+              : SqlitePersistence.layerConfig,
+          ),
+        ),
+        Layer.provideMerge(ServerEnvironment.layerIdentity),
+      );
+    }),
+  );
+
+export const layerRuntime = makeLayerRuntime(false);
+export const layerRuntimeExistingDatabase = makeLayerRuntime(true);
