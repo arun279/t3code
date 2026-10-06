@@ -731,11 +731,13 @@ const layerMakeServer = Layer.unwrap(
           port: address.port,
           serviceManaged: launcher.managed,
         });
-        yield* ownership.publish(state).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("Failed to persist server runtime state", { cause }),
-          ),
-        );
+        yield* ownership
+          .publish(state)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to persist server runtime state", { cause }),
+            ),
+          );
       }),
     );
     const layerTailscaleServe = config.tailscaleServeEnabled

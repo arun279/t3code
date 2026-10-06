@@ -1228,7 +1228,7 @@ describe("DesktopBackendManager", () => {
               }),
             ),
           ),
-          httpClientLayer: httpClientLayer(() => Effect.never),
+          httpClientLayer: layerHttpClient(() => Effect.never),
           onStateDirOwned: Deferred.succeed(refused, undefined).pipe(Effect.asVoid),
         });
         yield* instance.start;
