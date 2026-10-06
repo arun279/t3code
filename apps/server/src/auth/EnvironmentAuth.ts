@@ -28,7 +28,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
+import * as HttpServerRequest from "effect/http/HttpServerRequest";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerConfig from "../config.ts";
@@ -38,7 +38,7 @@ import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
-import * as SqlitePersistence from "../persistence/Layers/Sqlite.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { acquireServerOwnershipLock } from "../serverOwnershipLock.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -1126,7 +1126,7 @@ export const layer = Layer.effect(EnvironmentAuth, make).pipe(
   Layer.provideMerge(EnvironmentAuthPolicy.layer),
 );
 
-const storageLayer = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig);
+const layerStorage = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig);
 
 export class CliDatabaseAccessError extends Schema.TaggedError<CliDatabaseAccessError>()(
   "CliDatabaseAccessError",
@@ -1137,7 +1137,7 @@ export class CliDatabaseAccessError extends Schema.TaggedError<CliDatabaseAccess
   }
 }
 
-export const runtimeLayer = Layer.unwrap(
+export const layerRuntime = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     yield* Effect.acquireRelease(
@@ -1148,8 +1148,8 @@ export const runtimeLayer = Layer.unwrap(
       (lock) => Effect.sync(() => lock.close()),
     );
     return layer.pipe(
-      Layer.provideMerge(storageLayer),
-      Layer.provideMerge(ServerEnvironment.identityLayer),
+      Layer.provideMerge(layerStorage),
+      Layer.provideMerge(ServerEnvironment.layerIdentity),
     );
   }),
 );
