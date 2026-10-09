@@ -17,6 +17,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ProcessRunner from "../processRunner.ts";
 import { acquireServerOwnershipLock } from "../serverOwnershipLock.ts";
 import * as BootService from "./bootService.ts";
+import { bootServiceBaseDirOf } from "./bootServiceConfig.ts";
 import { pinnedRuntimePaths } from "./pinnedRuntime.ts";
 import {
   parseServiceState,
@@ -49,24 +50,22 @@ it("reads the served T3 home back out of a rendered unit or plist", () => {
     unitPath: "/home/theo/.config/systemd/user/t3code.service",
   });
 
-  expect(
-    BootService.bootServiceBaseDirOf(BootService.renderBootServiceUnit(plan("/home/theo/.t3"))),
-  ).toBe("/home/theo/.t3");
+  expect(bootServiceBaseDirOf(BootService.renderBootServiceUnit(plan("/home/theo/.t3")))).toBe(
+    "/home/theo/.t3",
+  );
   // Spaces and specifiers are quoted and escaped on the way in.
   expect(
-    BootService.bootServiceBaseDirOf(
-      BootService.renderBootServiceUnit(plan("/home/theo/T3 Data/100%")),
-    ),
+    bootServiceBaseDirOf(BootService.renderBootServiceUnit(plan("/home/theo/T3 Data/100%"))),
   ).toBe("/home/theo/T3 Data/100%");
   expect(
-    BootService.bootServiceBaseDirOf(
+    bootServiceBaseDirOf(
       BootService.renderBootServicePlist(plan("/Users/theo/a&b"), {
         homeDir: "/Users/theo",
         environmentPath: "/usr/bin",
       }),
     ),
   ).toBe("/Users/theo/a&b");
-  expect(BootService.bootServiceBaseDirOf("[Service]\nExecStart=/x\n")).toBeUndefined();
+  expect(bootServiceBaseDirOf("[Service]\nExecStart=/x\n")).toBeUndefined();
 });
 
 it("survives the kernel OOM-killing a greedy agent child", () => {

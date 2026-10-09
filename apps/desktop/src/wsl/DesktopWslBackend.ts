@@ -177,7 +177,7 @@ export const layer = Layer.effect(
                 Ref.set(
                   preflightErrorRef,
                   Option.some(
-                    "This distro's T3 home is owned by another server or needs interrupted-update recovery. Check the server logs, stop the existing server or recover the update, or pair with the running environment.",
+                    "This distro's T3 home is owned by another server, has an older background service that cannot share it safely, or needs interrupted-update recovery. Check the server logs. For an older background service, run `t3 update` to update it or `t3 service uninstall` to remove it. Otherwise, stop the existing server or recover the update, or pair with the running environment.",
                   ),
                 ),
               ),

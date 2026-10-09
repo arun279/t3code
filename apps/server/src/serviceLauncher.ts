@@ -10,7 +10,7 @@ import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import { acquireServerOwnershipLock } from "./serverOwnershipLock.ts";
-import { decodeServicePreflightResult } from "./cloud/servicePreflight.ts";
+import { runtimeOwnershipProbe, runtimeSupportsOwnership } from "./cloud/servicePreflight.ts";
 
 import type {
   PendingServiceUpdate,
@@ -72,38 +72,20 @@ const runtimeSpawnArguments = (paths: ReturnType<typeof runtimePaths>) => ({
   args: ["serve"],
 });
 
-/** This command reports capabilities without opening application persistence. */
-async function runtimeSupportsOwnership(
+async function probeRuntimeOwnership(
   baseDir: string,
   version: string,
   dbPath: string,
 ): Promise<boolean> {
   const env = { ...process.env };
   delete env[SERVICE_LAUNCHER_CONTEXT_ENV];
+  const probe = runtimeOwnershipProbe(runtimePaths(baseDir, version).entryPath, dbPath);
   return new Promise((resolve) => {
     NodeChildProcess.execFile(
-      runtimePaths(baseDir, version).entryPath,
-      [
-        "__service-preflight",
-        "--database-path",
-        dbPath,
-        "--launcher-protocol",
-        String(SERVICE_LAUNCHER_PROTOCOL),
-      ],
-      { env, timeout: 15_000, maxBuffer: 16_384 },
-      (error, stdout) => {
-        if (error !== null) return resolve(false);
-        try {
-          const result = decodeServicePreflightResult(JSON.parse(stdout));
-          resolve(
-            result?.status === "ready" &&
-              result.version === version &&
-              result.ownershipProtocol === 1,
-          );
-        } catch {
-          resolve(false);
-        }
-      },
+      probe.command,
+      probe.args,
+      { env, timeout: probe.timeoutMs, maxBuffer: probe.maxOutputBytes },
+      (error, stdout) => resolve(error === null && runtimeSupportsOwnership(stdout, version)),
     );
   });
 }
@@ -544,7 +526,7 @@ export class Launcher {
   }
 
   async #startTrial(pending: PendingServiceUpdate): Promise<void> {
-    if (!(await runtimeSupportsOwnership(this.#baseDir, pending.targetVersion, pending.dbPath))) {
+    if (!(await probeRuntimeOwnership(this.#baseDir, pending.targetVersion, pending.dbPath))) {
       await this.#returnToPrevious(pending, "failed", "ownership-protocol-unavailable");
       return;
     }
@@ -669,7 +651,7 @@ export class Launcher {
       await reject("The requested target runtime is missing or incomplete.");
       return;
     }
-    if (!(await runtimeSupportsOwnership(this.#baseDir, message.targetVersion, message.dbPath))) {
+    if (!(await probeRuntimeOwnership(this.#baseDir, message.targetVersion, message.dbPath))) {
       await reject("The requested runtime does not support safe database ownership.");
       return;
     }

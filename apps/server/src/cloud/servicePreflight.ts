@@ -64,3 +64,30 @@ export function decodeServicePreflightResult(value: unknown): ServicePreflightRe
   }
   return undefined;
 }
+
+/** This command reports capabilities without opening application persistence. */
+export function runtimeOwnershipProbe(command: string, databasePath: string) {
+  return {
+    command,
+    args: [
+      "__service-preflight",
+      "--database-path",
+      databasePath,
+      "--launcher-protocol",
+      String(SERVICE_LAUNCHER_PROTOCOL),
+    ],
+    timeoutMs: 15_000,
+    maxOutputBytes: 16_384,
+  };
+}
+
+export function runtimeSupportsOwnership(stdout: string, version: string): boolean {
+  try {
+    const result = decodeServicePreflightResult(JSON.parse(stdout));
+    return (
+      result?.status === "ready" && result.version === version && result.ownershipProtocol === 1
+    );
+  } catch {
+    return false;
+  }
+}

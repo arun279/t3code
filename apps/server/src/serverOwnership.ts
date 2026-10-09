@@ -1,12 +1,18 @@
 // @effect-diagnostics nodeBuiltinImport:off - Publication must finish synchronously while the scope holds ownership.
 // @effect-diagnostics schemaSyncInEffect:off - Descriptor validation and publication are synchronous under the ownership lock.
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import {
+  HostProcessEnvironment,
+  HostProcessPlatform,
+  HostProcessUserId,
+} from "@t3tools/shared/hostProcess";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { SERVER_EXIT_CODE_STATE_DIR_OWNED } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
+import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Runtime from "effect/Runtime";
 import * as Schema from "effect/Schema";
@@ -16,7 +22,18 @@ import { acquireServerOwnershipLock, SERVER_UPDATE_RECOVERY_FILE } from "./serve
 import {
   serviceStateHasPendingUpdate,
   serviceStatePendingUpdateId,
+  serviceStateActiveVersion,
+  SERVICE_LAUNCHER_CONTEXT_ENV,
+  SERVICE_STATE_FILE,
 } from "./cloud/serviceProtocol.ts";
+import {
+  BOOT_SERVICE_LAUNCHD_LABEL,
+  BOOT_SERVICE_PLIST_FILE,
+  BOOT_SERVICE_UNIT_FILE,
+  BOOT_SERVICE_UNIT_ENV,
+  bootServiceBaseDirOf,
+} from "./cloud/bootServiceConfig.ts";
+import { runtimeOwnershipProbe, runtimeSupportsOwnership } from "./cloud/servicePreflight.ts";
 
 import {
   isProcessAlive,
@@ -43,6 +60,17 @@ export class ServerOwnershipError extends Schema.TaggedError<ServerOwnershipErro
 ) {
   override get message(): string {
     return `Could not acquire or update server ownership at ${this.statePath}.`;
+  }
+}
+
+export class LegacyBootServiceError extends Schema.TaggedError<LegacyBootServiceError>()(
+  "LegacyBootServiceError",
+  { stateDir: Schema.String, version: Schema.String },
+) {
+  override readonly [Runtime.errorExitCode] = SERVER_EXIT_CODE_STATE_DIR_OWNED;
+
+  override get message(): string {
+    return `A background service for this T3 home (${this.stateDir}) runs an older T3 Code version (${this.version}) that cannot share it safely. Run t3 update to update the service or t3 service uninstall to remove it, then retry. No server was stopped.`;
   }
 }
 
@@ -136,6 +164,79 @@ const legacyOwnerIsLive = Effect.fn("legacyOwnerIsLive")(function* (
   return !Number.isFinite(startedAt) || startedAt <= recordedAt + 1_000;
 });
 
+const legacyBootServiceVersion = Effect.fn("legacyBootServiceVersion")(
+  function* (statePath: string) {
+    const env = yield* HostProcessEnvironment;
+    if (env[SERVICE_LAUNCHER_CONTEXT_ENV] !== undefined || env[BOOT_SERVICE_UNIT_ENV] !== undefined)
+      return;
+    const platform = yield* HostProcessPlatform;
+    if (platform !== "darwin" && platform !== "linux") return;
+    const home = yield* Config.String("HOME").pipe(Config.withDefault(""));
+    if (home === "") return;
+    const uid = yield* HostProcessUserId;
+    if (platform === "darwin" && uid === undefined) return;
+    const fs = yield* FileSystem.FileSystem;
+    const unit = yield* fs.readFileString(
+      platform === "darwin"
+        ? NodePath.join(home, "Library", "LaunchAgents", BOOT_SERVICE_PLIST_FILE)
+        : NodePath.join(home, ".config", "systemd", "user", BOOT_SERVICE_UNIT_FILE),
+    );
+    const baseDir = bootServiceBaseDirOf(unit);
+    if (baseDir === undefined) return;
+    if (
+      (yield* fs.realPath(baseDir)) !==
+      (yield* fs.realPath(NodePath.dirname(NodePath.dirname(statePath))))
+    )
+      return;
+    const runner = yield* ProcessRunner.ProcessRunner;
+    const probe = (command: string, args: ReadonlyArray<string>) =>
+      runner.run({ command, args, timeout: Duration.seconds(5), maxOutputBytes: 16_384 });
+    if (platform === "darwin") {
+      const loaded = yield* probe("launchctl", [
+        "print",
+        `gui/${uid}/${BOOT_SERVICE_LAUNCHD_LABEL}`,
+      ]);
+      if (loaded.code !== 0) {
+        const disabled = yield* probe("launchctl", ["print-disabled", `gui/${uid}`]);
+        // macOS 13+ prints `=> disabled`; earlier releases print `=> true`.
+        if (
+          disabled.code !== 0 ||
+          [
+            `"${BOOT_SERVICE_LAUNCHD_LABEL}" => disabled`,
+            `"${BOOT_SERVICE_LAUNCHD_LABEL}" => true`,
+          ].some((line) => disabled.stdout.includes(line))
+        )
+          return;
+      }
+    } else {
+      const active = yield* probe("systemctl", ["--user", "is-active", BOOT_SERVICE_UNIT_FILE]);
+      if (active.code !== 0) {
+        const enabled = yield* probe("systemctl", ["--user", "is-enabled", BOOT_SERVICE_UNIT_FILE]);
+        if (enabled.code !== 0 || enabled.stdout.trim() !== "enabled") return;
+      }
+    }
+    // The state file and `__service-preflight` shipped in the same release, so
+    // every runtime named here answers the probe instead of starting a server.
+    const version = serviceStateActiveVersion(
+      yield* fs.readFileString(NodePath.join(baseDir, "runtime", SERVICE_STATE_FILE)),
+    );
+    if (version === undefined) return;
+    const capability = runtimeOwnershipProbe(
+      NodePath.join(baseDir, "runtime", "versions", version, "t3"),
+      NodePath.join(baseDir, "userdata", "statev2.sqlite"),
+    );
+    const result = yield* runner.run({
+      command: capability.command,
+      args: capability.args,
+      timeout: Duration.millis(capability.timeoutMs),
+      maxOutputBytes: capability.maxOutputBytes,
+    });
+    if (result.timedOut) return;
+    if (result.code !== 0 || !runtimeSupportsOwnership(result.stdout, version)) return version;
+  },
+  Effect.orElseSucceed(() => undefined),
+);
+
 /**
  * Hold an OS file lock until the server and its finalizers stop. This separate
  * SQLite file never contains application data and must never be unlinked.
@@ -218,6 +319,12 @@ export const acquireServerOwnership = Effect.fn("acquireServerOwnership")(functi
     (yield* legacyOwnerIsLive(previous.value))
   ) {
     return yield* new ServerAlreadyRunningError({ stateDir: resource.lock.stateDir });
+  }
+
+  if (trial === undefined) {
+    const version = yield* legacyBootServiceVersion(statePath);
+    if (version !== undefined)
+      return yield* new LegacyBootServiceError({ stateDir: resource.lock.stateDir, version });
   }
 
   yield* Effect.try({
